@@ -124,7 +124,6 @@ npm install
 Create a `.env` file in the project root:
 ```env
 DATABASE_URL=postgresql://user:password@host:5432/dbname
-PORT=8000
 ```
 
 ### 3. Create database tables
