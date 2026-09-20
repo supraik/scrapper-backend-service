@@ -224,4 +224,4 @@ node init/debug_api.js
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | Full PostgreSQL connection string |
-| `PORT` | Server port (default: `8000`) |
+
