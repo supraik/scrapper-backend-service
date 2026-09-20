@@ -442,7 +442,7 @@ async function runScraperPipeline(productIds) {
 
     console.log(`\n🌍  Launching Chromium browser...`);
     const browser = await puppeteer.launch({
-        headless: false,
+        headless: true,
         args: [
             "--no-sandbox",
             "--disable-setuid-sandbox",
