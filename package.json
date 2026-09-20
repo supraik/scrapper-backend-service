@@ -1,0 +1,17 @@
+{
+  "name": "price-scraper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.0",
+    "express": "^5.2.1",
+    "node-cron": "^3.0.3",
+    "pg": "^8.23.0",
+    "puppeteer": "^22.15.0",
+    "uuid": "^14.0.2"
+  }
+}
