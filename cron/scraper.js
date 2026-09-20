@@ -1,7 +1,7 @@
 const puppeteer = require("puppeteer");
 
 const MAX_TABS    = 3;
-const MAX_RETRIES = 2;
+const MAX_RETRIES = 5;
 const BASE_URL    = "https://demo.inelabteamdev.com/product/";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -21,65 +21,100 @@ async function configureResourceBlocking(page) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cookie overlay — just display:none it, no fancy waiting
+// Cookie overlay — display:none everything cookie-related, no waiting
 // ─────────────────────────────────────────────────────────────────────────────
 async function hideCookieOverlay(page) {
     try {
         await page.evaluate(() => {
-            const el = document.querySelector(".cookie-overlay");
-            if (el) el.style.display = "none";
+            const kill = (el) => {
+                if (!el) return;
+                el.style.display       = "none";
+                el.style.visibility    = "hidden";
+                el.style.pointerEvents = "none";
+            };
+            [
+                ".cookie-overlay",
+                "#cookie-overlay",
+                "[class*='cookie-banner']",
+                "[id*='cookie-banner']",
+                "[class*='cookie-consent']",
+                "[id*='cookie-consent']",
+                "[class*='gdpr']",
+                "[id*='gdpr']",
+            ].forEach((sel) => document.querySelectorAll(sel).forEach(kill));
         });
     } catch (_) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Debug dump — logs full product-level HTML when something goes wrong.
+// Call BEFORE closing the tab so the page is still alive.
+// ─────────────────────────────────────────────────────────────────────────────
+async function dumpDebugHtml(page, productId, context) {
+    try {
+        const html = await page.evaluate(() => {
+            const detailInfo = document.querySelector(".detail-info");
+            const priceBlock = document.querySelector(".price-block");
+            return {
+                detailInfo : detailInfo ? detailInfo.outerHTML : "[.detail-info not found]",
+                priceBlock : priceBlock ? priceBlock.outerHTML : "[.price-block not found]",
+            };
+        });
+        console.error(`\n🔍  [Product ${productId}] ── DEBUG HTML DUMP (${context}) ──`);
+        console.error(`     .detail-info → ${html.detailInfo}`);
+        console.error(`     .price-block → ${html.priceBlock}`);
+        console.error(`     ─────────────────────────────────────────────────────\n`);
+    } catch (e) {
+        console.error(`🔍  [Product ${productId}] HTML dump failed (page already closed?): ${e.message}`);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Price parser — handles every format the site throws at us:
 //
-//  Format                      Example raw text          → Result
-//  ─────────────────────────── ─────────────────────     ────────
-//  Normal comma-thousands      ₹21,626                   → 21626
-//  Space-thousands             ₹12 449                   → 12449
-//  Full-width unicode digits   ₹４２,１４４               → 42144
-//  Indian lakh format          ₹1,26,960                 → 126960
-//  Trailing paise              Rs. 50,707.00             → 50707
-//  EU/glitchy (dot < comma)    ₹50.707,00                → 50  ← site bug, expected
-//  With deal/prefix text       (stripped by caller)
+//  Format                         Example raw text           → Result
+//  ────────────────────────────── ─────────────────────────  ────────
+//  Normal comma-thousands         ₹21,626                    → 21626
+//  Space-thousands                ₹12 449                    → 12449
+//  Full-width unicode digits      ₹４２,１４４                → 42144
+//  Indian lakh format             ₹1,26,960                  → 126960
+//  Trailing paise (Indian sep)    Rs. 50,707.00              → 50707
+//  EU/glitchy (dot before comma)  ₹50.707,00                 → 50  ← site bug
+//  Char-split with ZWS            ₹​1​3​,​1​8​4 (k2 div) → 13184
 // ─────────────────────────────────────────────────────────────────────────────
 function parsePrice(rawText) {
     if (!rawText) return null;
 
     // 1. NFKC normalization: full-width digits (１２３) → ASCII (123)
     //    + strip zero-width / non-breaking / soft-hyphen chars
+    //    This is essential for the k2 "char-split" div: each character span
+    //    has a trailing U+200B (zero-width space) that must be removed first.
     let text = rawText
         .normalize("NFKC")
-        .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
-        .replace(/\u00A0/g, " ")
+        .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")   // strip ZWS and relatives
+        .replace(/\u00A0/g, " ")                         // NBSP → regular space
         .trim();
 
-    // 2. Strip currency symbols and prefixes (₹, Rs., Rs, INR — any case)
+    // 2. Strip currency symbols/prefixes (₹, Rs., Rs, INR — any case)
     text = text.replace(/(?:Rs\.?\s*|₹\s*|INR\s*)/gi, "").trim();
 
     if (!text) return null;
 
-    // 3. Detect whether this is European/glitchy format (dot appears before comma)
-    //    e.g. "50.707,00" — site is outputting bad data in EU notation.
-    //    In that case just take the digits before the first dot (→ 50).
-    //    Otherwise treat commas + spaces as Indian thousands separators.
+    // 3. Detect EU/glitchy format: dot appears BEFORE the first comma
+    //    e.g. "50.707,00" — site bug, grab only digits before the dot (→ 50)
+    //    Normal Indian format: commas/spaces are thousands separators
     const firstDot   = text.indexOf(".");
     const firstComma = text.indexOf(",");
 
     let integerStr;
-
     if (firstDot !== -1 && firstComma !== -1 && firstDot < firstComma) {
-        // EU / glitchy: dot is thousands separator here — grab only what's before it
+        // EU/glitchy: take only the digits strictly before the first dot
         integerStr = text.slice(0, firstDot).replace(/[^0-9]/g, "");
     } else {
-        // Indian / standard: commas and spaces are thousands separators;
-        // a trailing ".xx" is decimal paise → drop it
         integerStr = text
-            .replace(/[, ]/g, "")    // remove thousands separators
-            .replace(/\.\d*$/, "")   // strip decimal portion
-            .replace(/[^0-9]/g, ""); // safety-strip any remaining non-digits
+            .replace(/[, ]/g, "")     // strip thousands separators (commas + spaces)
+            .replace(/\.\d*$/, "")    // drop decimal paise (.00, .50, etc.)
+            .replace(/[^0-9]/g, "");  // safety-strip anything non-digit remaining
     }
 
     if (!integerStr) return null;
@@ -88,34 +123,175 @@ function parsePrice(rawText) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Price extractor — reads the pv-a7 span from a price-success block.
-// Call only once .price-block.price-success is confirmed to be in the DOM.
+// Price extractor — reads the final selling price from a price-success block.
+//
+// ══ THE SITE RENDERS THE PRICE ELEMENT IN TWO DIFFERENT WAYS ══════════════
+//
+//  ① SPAN variant  (pages with pw-a7 suffix):
+//       <span class="RANDOM pv-a7" style="...">₹21,626</span>
+//     textContent gives the price string directly.
+//
+//  ② DIV + char-split variant  (pages with pw-k2 suffix):
+//       <div class="RANDOM pv-k2" style="...">
+//         <span>₹​</span><span>1​</span><span>3​</span><span>,​</span>...
+//       </div>
+//     Each character is in its own <span>; U+200B (zero-width space) trails
+//     each character.  textContent on the div concatenates all child text
+//     nodes, giving e.g. "₹​1​3​,​1​8​4".  parsePrice strips the U+200B chars.
+//
+//  SELECTOR PHILOSOPHY (stable, not class-suffix-dependent):
+//    ✅  [class*="pv-"]                — matches BOTH <span> AND <div> variants
+//    ❌  span[class*="pv-"]            — BUG: misses the DIV form entirely!
+//    ✅  .price-block.price-success    — stable state class
+//    ✅  .price-main                   — stable container
+//    ❌  [class*="pv-k2"] / [class*="pv-a7"]  — never hardcode the suffix
+//
+//  WHY textContent OVER innerText:
+//    In headless Chrome, innerText depends on CSS layout being fully computed;
+//    textContent always works and correctly concatenates all descendant text.
 // ─────────────────────────────────────────────────────────────────────────────
 async function extractPrice(page, productId) {
-    const raw = await page.evaluate(() => {
-        // The real price is always in the span carrying the "pv-a7" class.
-        // The random prefix class (ve6llzt, v4sf02u …) changes per product,
-        // so we use a substring attribute selector on className.
-        const span = document.querySelector(".price-main [class*='pv-a7']");
-        if (!span) return null;
-        // innerText respects CSS visibility; textContent as fallback
-        return (span.innerText || span.textContent || "").trim();
+    const result = await page.evaluate(() => {
+        // Anchor to the success block so we never accidentally read a stale span
+        const successBlock = document.querySelector(".price-block.price-success");
+        if (!successBlock) {
+            return {
+                raw          : null,
+                pvFound      : false,
+                pvTag        : null,
+                pvClass      : null,
+                priceMainHtml: "[.price-block.price-success not in DOM]",
+            };
+        }
+
+        const priceMain     = successBlock.querySelector(".price-main");
+        const priceMainHtml = priceMain ? priceMain.outerHTML
+                                        : "[.price-main not found inside success block]";
+
+        if (!priceMain) {
+            return { raw: null, pvFound: false, pvTag: null, pvClass: null, priceMainHtml };
+        }
+
+        // ── THE FIX: [class*="pv-"] not span[class*="pv-"] ─────────────────────
+        // Matches both the <span> (pw-a7) and <div> (pw-k2) price element variants.
+        // "pv-" prefix never appears in any other class inside .price-main, so
+        // this selector is unique and safe.
+        const pvEl = priceMain.querySelector('[class*="pv-"]');
+
+        if (!pvEl) {
+            return { raw: null, pvFound: false, pvTag: null, pvClass: null, priceMainHtml };
+        }
+
+        // textContent works for both:
+        //   • direct-text span  → returns the price string as-is
+        //   • char-split div    → concatenates all child <span> text nodes
+        //     (zero-width chars are stripped later by parsePrice)
+        const raw = (pvEl.textContent || "").trim() || null;
+
+        return {
+            raw,
+            pvFound      : true,
+            pvTag        : pvEl.tagName.toLowerCase(),   // "span" or "div"
+            pvClass      : pvEl.className,
+            priceMainHtml: null,                         // only populated on failure
+        };
     });
 
-    console.log(`🔤  [Product ${productId}] Raw price text from DOM → "${raw}"`);
+    // ── Logging ──────────────────────────────────────────────────────────────
+    console.log(`🔤  [Product ${productId}] Price extraction:`);
+    if (result.pvFound) {
+        console.log(`     Element found : true  <${result.pvTag} class="${result.pvClass}">`);
+        console.log(`     Raw text      : "${result.raw}"`);
+    } else {
+        console.log(`     Element found : false`);
+        console.log(`     Raw text      : "null"`);
+    }
 
-    if (!raw) {
-        console.warn(`⚠️   [Product ${productId}] pv-a7 span returned empty text`);
+    if (!result.pvFound || !result.raw) {
+        console.error(`⚠️   [Product ${productId}] pv element not found or empty. price-main HTML:`);
+        console.error(`     ${result.priceMainHtml}`);
         return null;
     }
 
-    const price = parsePrice(raw);
+    const price = parsePrice(result.raw);
 
     if (price === null) {
-        console.warn(`⚠️   [Product ${productId}] parsePrice could not extract a number from "${raw}"`);
+        console.warn(`⚠️   [Product ${productId}] parsePrice could not extract a number from "${result.raw}"`);
+    } else {
+        console.log(`💰  [Product ${productId}] Parsed price → ₹${price}`);
     }
 
     return price;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Page state reader — single evaluate for the checkpoint loop.
+// Reads all relevant DOM signals in one round-trip to minimise latency.
+//
+// States returned:
+//   "success"      — .price-block.price-success present (price is extractable)
+//   "loading"      — spinner or aria-busy="true", not yet success/error
+//   "error"        — .price-block.price-error; hasTryAgain says whether btn exists
+//   "reveal-active"— Reveal Price button is in the DOM and enabled (click missed)
+//   "unknown"      — none of the above (transitional)
+//   "no-block"     — .price-block not in DOM at all
+//
+// isUpdating flag (set when state === "success"):
+//   True when price-success is present but an "Updating…" inline text span is
+//   visible — the price value has been set but the site is still refining it.
+//   We still extract the current pv value (samples 10 & 15 confirm this is valid).
+// ─────────────────────────────────────────────────────────────────────────────
+async function readPageState(page) {
+    return page.evaluate(() => {
+        const block = document.querySelector(".price-block");
+        if (!block) return { type: "no-block", classes: "", hasTryAgain: false, isUpdating: false };
+
+        const classes    = block.className;
+        const ariaBusy   = block.getAttribute("aria-busy");
+        const hasSpinner = !!block.querySelector(".spinner");
+
+        // Stable semantic state classes (ignore the dynamic pw-* suffix entirely)
+        const hasSuccess = block.classList.contains("price-success");
+        const hasError   = block.classList.contains("price-error");
+
+        // Loading = spinner present OR aria-busy="true", and not yet success/error
+        const isLoading  = !hasSuccess && !hasError && (ariaBusy === "true" || hasSpinner);
+
+        // "Updating…" sub-state: price-success is set but the site is still
+        // refining the value (pv element opacity ~0.45, "Updating…" span visible).
+        // The pv value is still valid to read — we extract it and return it.
+        let isUpdating = false;
+        if (hasSuccess) {
+            const spans = block.querySelectorAll("span");
+            for (const s of spans) {
+                // "Updating…" span has no class and no aria-hidden — it is visible
+                if (/Updating/i.test(s.textContent) && !s.getAttribute("aria-hidden")) {
+                    isUpdating = true;
+                    break;
+                }
+            }
+        }
+
+        // "Try again" button inside the error block
+        const tryAgainBtn = hasError ? block.querySelector("button.btn-primary") : null;
+        const hasTryAgain = !!tryAgainBtn;
+
+        // Reveal button — identified by aria-label (stable), not by class
+        const revealBtn    = document.querySelector('button[aria-label="Reveal price"]');
+        const revealActive = !!(revealBtn && !revealBtn.disabled);
+
+        return {
+            type: hasSuccess    ? "success"
+                : hasError      ? "error"
+                : isLoading     ? "loading"
+                : revealActive  ? "reveal-active"
+                :                 "unknown",
+            classes,
+            hasTryAgain,
+            revealActive,
+            isUpdating,
+        };
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +313,7 @@ async function scrapeProductPage(page, productId) {
     await hideCookieOverlay(page);
     console.log(`✔️   [Product ${productId}] Cookie overlay handled`);
 
-    // ── Fast-path: price might already be in success state ───────────────────
+    // ── Fast-path: price already in success state (cached / SSR) ─────────────
     {
         const alreadySuccess = await page.evaluate(
             () => !!document.querySelector(".price-block.price-success")
@@ -146,14 +322,14 @@ async function scrapeProductPage(page, productId) {
             console.log(`⚡  [Product ${productId}] price-block already in success state — skipping hover+click`);
             const price = await extractPrice(page, productId);
             if (price !== null) {
-                console.log(`🎯  [Product ${productId}] Price extracted → ${price}`);
+                console.log(`🎯  [Product ${productId}] Price on fast-path → ₹${price}`);
                 return { product_id: productId, price, timestamp: new Date().toISOString() };
             }
-            console.warn(`⚠️   [Product ${productId}] Fast-path found success block but parse failed — continuing normally`);
+            console.warn(`⚠️   [Product ${productId}] Fast-path: success block present but price parse failed — continuing normally`);
         }
     }
 
-    // ── Wait for the substatus paragraph ──────────────────────────────────────
+    // ── Wait for .price-substatus (the hover-trigger text element) ───────────
     console.log(`🔎  [Product ${productId}] Waiting for .price-substatus to be visible...`);
     try {
         await page.waitForSelector(".price-substatus", { visible: true, timeout: 10000 });
@@ -162,16 +338,17 @@ async function scrapeProductPage(page, productId) {
     }
     console.log(`✅  [Product ${productId}] .price-substatus is visible`);
 
-    // ── PHASE 1: Hover loop — activate the Reveal button ─────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 1 — Hover loop: activate the Reveal Price button
     //
-    // We hover over the substatus paragraph, wait 500ms, then check if the
-    // Reveal button flipped from disabled → enabled.
-    // If still disabled: suppress cookie overlay and try again (up to 8 times).
+    // The Reveal Price button starts disabled.  Hovering over .price-substatus
+    // triggers the site's JS to enable it.  We hover → wait 500ms → check.
+    // On each miss we re-suppress the cookie overlay and try again (up to 8×).
     // ─────────────────────────────────────────────────────────────────────────
     const MAX_HOVER_ATTEMPTS = 8;
     let buttonActivated = false;
 
-    console.log(`🖱️   [Product ${productId}] Starting hover loop (max ${MAX_HOVER_ATTEMPTS} attempts)...`);
+    console.log(`🖱️   [Product ${productId}] PHASE 1 — Hover loop (max ${MAX_HOVER_ATTEMPTS} attempts)...`);
 
     for (let ha = 1; ha <= MAX_HOVER_ATTEMPTS; ha++) {
         console.log(`     [Product ${productId}] Hover attempt ${ha}/${MAX_HOVER_ATTEMPTS} — suppressing cookie first...`);
@@ -179,19 +356,19 @@ async function scrapeProductPage(page, productId) {
 
         const substatusEl = await page.$(".price-substatus");
         if (!substatusEl) {
-            // Substatus is gone — price may have loaded during our wait
-            console.log(`❓  [Product ${productId}] .price-substatus disappeared — checking if price loaded...`);
+            // Element gone — the block already transitioned to loading/success
+            console.log(`❓  [Product ${productId}] .price-substatus disappeared — block may have transitioned already`);
             break;
         }
 
         const box = await substatusEl.boundingBox();
         if (!box) {
-            console.log(`⚠️   [Product ${productId}] Could not get bounding box — retrying in 300ms...`);
+            console.log(`⚠️   [Product ${productId}] Bounding box unavailable — retrying in 300ms...`);
             await sleep(300);
             continue;
         }
 
-        const cx = box.x + box.width / 2;
+        const cx = box.x + box.width  / 2;
         const cy = box.y + box.height / 2;
         console.log(`     [Product ${productId}] Moving mouse → (${Math.round(cx)}, ${Math.round(cy)})...`);
         await page.mouse.move(cx, cy, { steps: 10 });
@@ -199,6 +376,7 @@ async function scrapeProductPage(page, productId) {
         console.log(`     [Product ${productId}] Hovering — waiting 500ms for button to activate...`);
         await sleep(500);
 
+        // Check button state using aria-label (stable), not class
         const btnState = await page.evaluate(() => {
             const btn = document.querySelector('button[aria-label="Reveal price"]');
             if (!btn) return "missing";
@@ -217,18 +395,19 @@ async function scrapeProductPage(page, productId) {
         }
     }
 
-    // ── Between-phase check: did price load during hover? ────────────────────
+    // ── Between-phase check: did price succeed during the hover phase? ────────
     {
-        const successDuringHover = await page.evaluate(
+        const successAfterHover = await page.evaluate(
             () => !!document.querySelector(".price-block.price-success")
         );
-        if (successDuringHover) {
+        if (successAfterHover) {
             console.log(`⚡  [Product ${productId}] price-success appeared during hover phase — extracting now!`);
             const price = await extractPrice(page, productId);
             if (price !== null) {
-                console.log(`🎯  [Product ${productId}] Price extracted → ${price}`);
+                console.log(`🎯  [Product ${productId}] Price extracted → ₹${price}`);
                 return { product_id: productId, price, timestamp: new Date().toISOString() };
             }
+            console.warn(`⚠️   [Product ${productId}] price-success during hover but parse failed — continuing to Phase 2`);
         }
     }
 
@@ -236,129 +415,95 @@ async function scrapeProductPage(page, productId) {
         throw new Error(`Reveal button could not be activated after ${MAX_HOVER_ATTEMPTS} hover attempts`);
     }
 
-    // ── PHASE 2: Post-click checkpoint state machine ─────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHASE 2 — Click → checkpoint state machine
     //
-    // Now that Phase 1 has confirmed the Reveal button is active, we:
-    //   1. Fire the initial click on the Reveal button.
-    //   2. Enter a checkpoint loop that reads the current DOM state each round
-    //      and decides what to do next:
+    // Button is confirmed active.  Click it, wait 3s, then loop over
+    // checkpoints reading the page state each round:
     //
-    //   ┌──────────────────────────────────────────────────────────────────┐
-    //   │  CLICK Reveal Price (initial — button is guaranteed active here) │
-    //   └────────────────────────────┬─────────────────────────────────────┘
-    //                                │  wait 3 s
-    //                                ▼
-    //   ┌──────────────────────────────────────────────────────────────────┐
-    //   │  CHECKPOINT — read .price-block state                            │
-    //   │                                                                  │
-    //   │  ① price-success?         → extract & DONE ✅                   │
-    //   │  ② loading?  (spinner /   → wait 3 s → next checkpoint          │
-    //   │     aria-busy / no error)                                        │
-    //   │  ③ price-error?           → click "Try again" btn               │
-    //   │                              wait 3 s → next checkpoint          │
-    //   │  ④ Reveal btn still       → click it again                      │
-    //   │     active? (click missed)   wait 3 s → next checkpoint          │
-    //   │  ⑤ none of the above     → wait 3 s → next checkpoint           │
-    //   └──────────────────────────────────────────────────────────────────┘
+    //   ① .price-block.price-success  → extract price → DONE ✅
+    //      • "Updating…" sub-state: price IS readable — extract and return it
+    //        (samples 10 & 15 confirm the interim value is the expected result)
+    //   ② Loading (spinner / aria-busy)→ wait 3s → next checkpoint
+    //   ③ .price-block.price-error    → click "Try again" → wait 3s
+    //   ④ Reveal button still active  → click missed, re-click → wait 3s
+    //   ⑤ None of the above          → wait 3s → next checkpoint
     //
+    // All state detection uses stable semantic classes / attributes only.
     // ─────────────────────────────────────────────────────────────────────────
     const MAX_CLICK_ROUNDS = 15;
 
-    // ── Initial click — button is active, confirmed by Phase 1 ──────────────
     console.log(`\n🖱️   [Product ${productId}] PHASE 2 — Initial click on Reveal Price button...`);
     await page.click('button[aria-label="Reveal price"]');
     console.log(`✅  [Product ${productId}] Reveal clicked! Waiting 3s before first checkpoint...`);
     await sleep(3000);
 
-    // ── Checkpoint loop ──────────────────────────────────────────────────────
     console.log(`\n🔁  [Product ${productId}] Entering checkpoint loop (max ${MAX_CLICK_ROUNDS} rounds)...`);
 
     for (let round = 1; round <= MAX_CLICK_ROUNDS; round++) {
-
         console.log(`\n📍  [Product ${productId}] ── Checkpoint ${round}/${MAX_CLICK_ROUNDS} ──`);
 
-        // Read every relevant signal from the DOM in a single evaluate call
-        const state = await page.evaluate(() => {
-            const block     = document.querySelector(".price-block");
-            if (!block) return { type: "no-block", className: "" };
+        const state = await readPageState(page);
 
-            const cls        = block.className;
-            const ariaBusy   = block.getAttribute("aria-busy");
-            const hasSpinner = !!block.querySelector(".spinner");
-            const hasSuccess = cls.includes("price-success");
-            const hasError   = cls.includes("price-error");
-            // Loading = not success, not error, but spinner present OR aria-busy="true"
-            const isLoading  = !hasSuccess && !hasError && (ariaBusy === "true" || hasSpinner);
+        const updatingTag = state.isUpdating ? " (Updating…)" : "";
+        console.log(`📋  [Product ${productId}] State → "${state.type}"${updatingTag}  (classes: "${state.classes}")`);
 
-            const tryAgainBtn = block.querySelector("button.btn-primary");
-            const hasTryAgain = !!tryAgainBtn;
-
-            const revealBtn   = document.querySelector('button[aria-label="Reveal price"]');
-            const revealActive = revealBtn && !revealBtn.disabled;
-
-            return {
-                type: hasSuccess   ? "success"
-                    : hasError     ? "error"
-                    : isLoading    ? "loading"
-                    : revealActive ? "reveal-active"
-                    :                "unknown",
-                className:    cls,
-                hasTryAgain,
-                revealActive: !!revealActive,
-            };
-        });
-
-        console.log(`📋  [Product ${productId}] State → "${state.type}"  (classes: "${state.className}")`);
-
-        // ─── ① SUCCESS ─────────────────────────────────────────────────────
+        // ─── ① SUCCESS ───────────────────────────────────────────────────────
         if (state.type === "success") {
-            console.log(`🎉  [Product ${productId}] ✅ CP-1 — price-success! Extracting price...`);
+            if (state.isUpdating) {
+                console.log(`⏳  [Product ${productId}] CP-1 — price-success + Updating… (price refining, extracting current value)`);
+            } else {
+                console.log(`🎉  [Product ${productId}] ✅ CP-1 — price-success! Extracting price...`);
+            }
+
             const price = await extractPrice(page, productId);
             if (price !== null) {
-                console.log(`🎯  [Product ${productId}] Price extracted → ${price}`);
+                console.log(`🎯  [Product ${productId}] Price extracted → ₹${price}`);
                 return { product_id: productId, price, timestamp: new Date().toISOString() };
             }
-            // Edge case: success block rendered but span text not painted yet
-            console.warn(`⚠️   [Product ${productId}] price-success present but span empty — waiting 1.5 s then retrying...`);
-            await sleep(1500);
+
+            // Success block present but pv element not readable — wait and retry once
+            console.warn(`⚠️   [Product ${productId}] price-success present but pv element returned no price — waiting 2s and retrying once...`);
+            await sleep(2000);
             const retryPrice = await extractPrice(page, productId);
             if (retryPrice !== null) {
-                console.log(`🎯  [Product ${productId}] Price on retry → ${retryPrice}`);
+                console.log(`🎯  [Product ${productId}] Price on retry → ₹${retryPrice}`);
                 return { product_id: productId, price: retryPrice, timestamp: new Date().toISOString() };
             }
-            throw new Error("price-success state reached but pv-a7 span returned no parseable number");
+
+            throw new Error("price-success state reached but pv element returned no parseable price");
         }
 
-        // ─── ② LOADING ─────────────────────────────────────────────────────
+        // ─── ② LOADING (spinner / aria-busy) ────────────────────────────────
         if (state.type === "loading") {
-            console.log(`⏳  [Product ${productId}] ✅ CP-2 — Loading state (spinner / aria-busy). Waiting 3 s...`);
+            console.log(`⏳  [Product ${productId}] CP-2 — Loading state (spinner/aria-busy). Waiting 3s...`);
             await sleep(3000);
             continue;
         }
 
-        // ─── ③ ERROR / FAILED — click "Try again" ──────────────────────────
+        // ─── ③ ERROR — click "Try again" ─────────────────────────────────────
         if (state.type === "error") {
             if (state.hasTryAgain) {
-                console.log(`🔄  [Product ${productId}] ✅ CP-3 — Error state! Clicking "Try again"...`);
+                console.log(`🔄  [Product ${productId}] CP-3 — Error state! Clicking "Try again"...`);
                 try {
                     await page.click(".price-block.price-error button.btn-primary");
-                    console.log(`✅  [Product ${productId}] "Try again" clicked — waiting 3 s...`);
+                    console.log(`✅  [Product ${productId}] "Try again" clicked — waiting 3s...`);
                 } catch (e) {
-                    console.warn(`⚠️   [Product ${productId}] Click on "Try again" threw: ${e.message} — waiting anyway...`);
+                    console.warn(`⚠️   [Product ${productId}] "Try again" click threw: ${e.message} — waiting anyway...`);
                 }
             } else {
-                console.warn(`⚠️   [Product ${productId}] Error state but no "Try again" button found — waiting 3 s...`);
+                console.warn(`⚠️   [Product ${productId}] CP-3 — Error state but no "Try again" button found — waiting 3s...`);
             }
             await sleep(3000);
             continue;
         }
 
-        // ─── ④ REVEAL BUTTON STILL ACTIVE (click didn't register) ──────────
+        // ─── ④ REVEAL BUTTON STILL ACTIVE (click didn't register) ────────────
         if (state.type === "reveal-active") {
-            console.log(`🖱️   [Product ${productId}] ✅ CP-4 — Reveal button still active (click missed?). Re-clicking...`);
+            console.log(`🖱️   [Product ${productId}] CP-4 — Reveal button still active (click missed?). Re-clicking...`);
             try {
                 await page.click('button[aria-label="Reveal price"]');
-                console.log(`✅  [Product ${productId}] Re-clicked Reveal — waiting 3 s...`);
+                console.log(`✅  [Product ${productId}] Re-clicked Reveal — waiting 3s...`);
             } catch (e) {
                 console.warn(`⚠️   [Product ${productId}] Re-click threw: ${e.message} — waiting anyway...`);
             }
@@ -366,8 +511,8 @@ async function scrapeProductPage(page, productId) {
             continue;
         }
 
-        // ─── ⑤ UNKNOWN / TRANSITIONAL — just wait ──────────────────────────
-        console.log(`❓  [Product ${productId}] ✅ CP-5 — Unknown/transitional state. Waiting 3 s...`);
+        // ─── ⑤ UNKNOWN / TRANSITIONAL — just wait ────────────────────────────
+        console.log(`❓  [Product ${productId}] CP-5 — Unknown/transitional state ("${state.type}"). Waiting 3s...`);
         await sleep(3000);
     }
 
@@ -375,7 +520,7 @@ async function scrapeProductPage(page, productId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-product wrapper with retry logic
+// Per-product wrapper — opens a fresh tab per attempt, retries up to MAX_RETRIES
 // ─────────────────────────────────────────────────────────────────────────────
 async function processProductWithRetry(browser, productId) {
     let lastError = null;
@@ -392,13 +537,16 @@ async function processProductWithRetry(browser, productId) {
 
             await page.close();
             console.log(`📄  [Product ${productId}] Tab closed cleanly`);
-            console.log(`\n✨  [Product ${productId}] SUCCESS — price: ${data.price} | scraped at ${data.timestamp}`);
+            console.log(`\n✨  [Product ${productId}] SUCCESS — price: ₹${data.price} | scraped at ${data.timestamp}`);
             return data;
 
         } catch (error) {
             console.warn(`\n⚠️   [Product ${productId}] Attempt ${attempt}/${MAX_RETRIES} FAILED`);
             console.warn(`     Reason: ${error.message}`);
             lastError = error;
+
+            // Dump full product HTML BEFORE closing the tab — crucial for debugging
+            await dumpDebugHtml(page, productId, `attempt ${attempt} failure`);
 
             await page.close().catch(() => {});
             console.warn(`📄  [Product ${productId}] Tab closed after failure`);
@@ -414,10 +562,10 @@ async function processProductWithRetry(browser, productId) {
     console.error(`     Last error: ${lastError ? lastError.message : "unknown"}`);
 
     return {
-        product_id: productId,
-        price:      null,
-        timestamp:  new Date().toISOString(),
-        error:      lastError ? lastError.message : "Scrape failed",
+        product_id : productId,
+        price      : null,
+        timestamp  : new Date().toISOString(),
+        error      : lastError ? lastError.message : "Scrape failed",
     };
 }
 
